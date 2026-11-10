@@ -1,6 +1,8 @@
+#[cfg(feature = "ffi")]
+use polars::prelude::all_horizontal;
 use polars::{
     df,
-    prelude::{IntoLazy, RankOptions, all_horizontal, as_struct, col},
+    prelude::{IntoLazy, RankOptions, as_struct, col},
 };
 
 use super::*;
@@ -154,6 +156,7 @@ fn test_match_group_by_truncation_with_grouping() -> Fallible<()> {
     Ok(())
 }
 
+#[cfg(feature = "ffi")]
 #[test]
 fn test_match_truncation_predicate_tree() -> Fallible<()> {
     let bounds = vec![
@@ -174,9 +177,7 @@ fn test_match_truncation_predicate_tree() -> Fallible<()> {
         descending: false,
     };
     let truncate_num_groups = col("A").rank(rank_opt, None).over([col("ID")]).lt(lit(10));
-    let truncate_per_group = int_range(lit(0), len(), 1, DataType::Int64)
-        .over([col("A"), col("ID")])
-        .lt(lit(11));
+    let truncate_per_group = random_enumeration().over([col("A"), col("ID")]).lt(lit(11));
 
     assert_eq!(
         match_truncation_predicate(
@@ -207,6 +208,7 @@ fn test_match_truncation_predicate_tree() -> Fallible<()> {
     Ok(())
 }
 
+#[cfg(feature = "ffi")]
 #[test]
 fn test_match_truncation_predicate_op() -> Fallible<()> {
     let bound = Bound {
@@ -221,7 +223,7 @@ fn test_match_truncation_predicate_op() -> Fallible<()> {
             Ok(Some(vec![bound.clone()]))
         );
     };
-    let over = int_range(lit(0), len(), 1, DataType::Int64).over([col("A"), col("ID")]);
+    let over = random_enumeration().over([col("A"), col("ID")]);
 
     check(over.clone().lt_eq(lit(11)));
     check(over.clone().lt(lit(12)));
@@ -268,33 +270,76 @@ fn test_match_num_groups_predicate() -> Fallible<()> {
 
 #[test]
 fn test_match_per_group_predicate_enumerations() -> Fallible<()> {
-    let bound = Some(Bound {
-        by: HashSet::from([col("A")]),
-        per_group: Some(10),
-        num_groups: None,
-    });
-
     let check =
         |expr: Expr| match_per_group_predicate(&expr, &vec![col("A"), col("ID")], &col("ID"), 10);
 
     let range = int_range(lit(0), len(), 1, DataType::Int64);
-    assert_eq!(check(range.clone())?, bound);
-    assert_eq!(check(range.clone().reverse())?, bound);
-    assert_eq!(check(range.clone().shuffle(None))?, bound);
-    assert_eq!(
-        check(range.clone().sort_by([col("D")], Default::default()))?,
-        bound
-    );
+    assert!(check(range.clone()).is_err());
+    // Unsupported reorderings are not recognized as truncations.
+    assert!(check(range.clone().reverse())?.is_none());
+    assert!(check(range.clone().shuffle(None))?.is_none());
+    assert!(check(range.clone().sort_by([col("D")], Default::default()))?.is_none());
     assert!(check(int_range(lit(0), len(), 1, DataType::Int64).head(None))?.is_none());
     Ok(())
 }
 
+#[cfg(feature = "ffi")]
 #[test]
 fn test_match_per_group_predicate_id() -> Fallible<()> {
-    let range = int_range(lit(0), len(), 1, DataType::Int64);
+    let range = random_enumeration();
     // no matches should error
     assert!(match_per_group_predicate(&range, &vec![col("A")], &col("ID"), 10).is_err());
     // multiple matches should pass
     assert!(match_per_group_predicate(&range, &vec![col("ID"); 2], &col("ID"), 0)?.is_some());
+    Ok(())
+}
+
+#[cfg(feature = "ffi")]
+fn random_permutation(data: Expr, limit: Expr) -> Expr {
+    Expr::Function {
+        input: vec![data, limit],
+        function: FunctionExpr::FfiPlugin {
+            flags: polars_plan::prelude::FunctionOptions::length_preserving(),
+            lib: "opendp".into(),
+            symbol: "random_permutation_plugin".into(),
+            kwargs: Default::default(),
+        },
+    }
+}
+
+#[cfg(feature = "ffi")]
+fn random_enumeration() -> Expr {
+    random_permutation(
+        int_range(lit(0), len(), 1, DataType::Int64),
+        lit(polars::prelude::NULL),
+    )
+}
+
+#[cfg(feature = "ffi")]
+#[test]
+fn test_match_full_random_truncation_ranks() -> Fallible<()> {
+    use polars::prelude::{NamedFrom, Series};
+    let range = int_range(lit(0), len(), 1, DataType::Int64);
+    let check = |expr: Expr| match_per_group_predicate(&expr, &vec![col("ID")], &col("ID"), 1);
+    assert!(check(random_enumeration())?.is_some());
+    for limit in [
+        lit(0),
+        lit(1),
+        lit(-1),
+        lit(Series::new("k".into(), [1i64, 2])),
+    ] {
+        let sample = random_permutation(range.clone(), limit);
+        assert!(check(sample.clone())?.is_none());
+        assert!(
+            match_truncation_predicate(&sample.over([col("ID")]).lt(lit(1)), &col("ID")).is_err()
+        );
+    }
+    // Neither sorted physical indices nor their inverse ranks establish
+    // a supported invariant selection rule (even with a random final key).
+    for by in [vec![col("A")], vec![col("A"), random_enumeration()]] {
+        let sorted = range.clone().sort_by(by, Default::default());
+        assert!(check(sorted.clone())?.is_none());
+        assert!(check(sorted.arg_sort(false, false))?.is_none());
+    }
     Ok(())
 }

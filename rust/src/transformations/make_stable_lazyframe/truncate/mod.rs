@@ -15,7 +15,10 @@ use polars::prelude::*;
 use polars_plan::prelude::GroupbyOptions;
 
 use super::StableDslPlan;
-use super::group_by::{Resize, check_infallible, materialize_grouping_keys};
+use super::group_by::{
+    Resize, canonical_sort_dtype, check_infallible, check_permutation_invariance,
+    materialize_grouping_keys,
+};
 
 #[cfg(test)]
 mod test;
@@ -160,7 +163,24 @@ fn truncate_domain(mut domain: DslPlanDomain, truncation: &Truncation) -> Fallib
             Ok(domain)
         }
         Truncation::GroupBy { keys, aggs } => {
-            // each agg expression must be infallible
+            // The input identifier metric is unordered even within an id.
+            // Validate the entire aggregation before dropping identifiers.
+            let schema = Schema::from_iter(
+                domain
+                    .series_domains
+                    .iter()
+                    .map(|column| Field::new(column.name.clone(), column.dtype())),
+            );
+            for key in keys {
+                if !canonical_sort_dtype(&key.clone().to_field(&schema)?.dtype) {
+                    return fallible!(
+                        MakeTransformation,
+                        "Floating-point grouping keys may emit permutation-dependent representatives (signed zeros or NaN payloads)."
+                    );
+                }
+            }
+            aggs.iter()
+                .try_for_each(|e| check_permutation_invariance(e, &schema))?;
             aggs.iter()
                 .try_for_each(|e| check_infallible(e, Resize::Allow))?;
 

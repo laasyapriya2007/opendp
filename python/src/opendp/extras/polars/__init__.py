@@ -760,7 +760,8 @@ _LAZY_EXECUTION_METHODS = {
 class SortBy:
     """Configuration for ``keep`` in :py:meth:`LazyFrameQuery.truncate_per_group`.
 
-    Follows the arguments in Polars' ``sort_by`` method.
+    Sorted truncation is not currently supported: its permutation invariance
+    cannot yet be certified. Use ``keep="sample"`` instead.
     """
 
     by: Any
@@ -1003,7 +1004,10 @@ class LazyFrameQuery:
 
         :param k: the number of rows to keep for each identifier and group
         :param by: optional, additional columns to group by
-        :param keep: which rows to keep for each identifier in each group
+        :param keep: how to select rows for each identifier and group.
+            Physical 'first' and 'last' are rejected under unordered identifier
+            metrics. SortBy selection cannot yet be certified as permutation-
+            invariant. Only sample is currently supported.
         """
         input_metric = self._query._chain[1]
 
@@ -1018,16 +1022,20 @@ class LazyFrameQuery:
             raise ValueError("truncation is only valid when identifier is defined")
 
         if keep == "sample":
-            indexes = pl.int_range(pl.len()).shuffle()
-        elif keep == "first":
-            indexes = pl.int_range(pl.len())
-        elif keep == "last":
-            indexes = pl.int_range(pl.len()).reverse()
+            indexes = pl.int_range(pl.len()).dp.random_permutation()
+        elif keep in ("first", "last"):
+            raise ValueError(
+                "Physical first/last truncation is not invariant under unordered "
+                "identifier metrics. Use 'sample'."
+            )
         elif isinstance(keep, SortBy):
-            indexes = pl.int_range(pl.len()).sort_by(**asdict(keep))
+            raise ValueError(
+                "SortBy truncation cannot yet be certified as permutation-invariant. "
+                "Use 'sample' instead."
+            )
         else:
             raise ValueError(
-                "keep must be 'sample', 'first', 'last' or SortBy"
+                "keep must be 'sample'; first/last and SortBy are not supported"
             )  # pragma: no cover
 
         return self.filter(indexes.over(input_metric.identifier, *by or []) < k)

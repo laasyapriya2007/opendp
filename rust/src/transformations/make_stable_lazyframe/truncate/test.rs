@@ -371,3 +371,61 @@ fn test_truncate_materializes_each_bound_grouping_subset() -> Fallible<()> {
     assert_eq!(output.column("len")?.u32()?.get(0), Some(4));
     Ok(())
 }
+
+#[test]
+fn test_truncate_domain_requires_permutation_invariant_aggregations() -> Fallible<()> {
+    let domain = DslPlanDomain::new(vec![
+        SeriesDomain::new("ID", AtomDomain::<i32>::default()),
+        SeriesDomain::new("value", AtomDomain::<f64>::default()),
+        SeriesDomain::new("integer", AtomDomain::<i64>::default()),
+    ])?;
+    for agg in [
+        col("value").first(),
+        col("value").mean(),
+        col("value").sum(),
+        col("value").sort(Default::default()).mean(),
+    ] {
+        assert!(
+            truncate_domain(
+                domain.clone(),
+                &Truncation::GroupBy {
+                    keys: vec![col("ID")],
+                    aggs: vec![agg],
+                }
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        truncate_domain(
+            domain,
+            &Truncation::GroupBy {
+                keys: vec![col("ID")],
+                aggs: vec![col("integer").sort(Default::default()).mean()],
+            }
+        )
+        .is_ok()
+    );
+    Ok(())
+}
+
+#[test]
+fn test_truncate_rejects_floating_grouping_representatives() -> Fallible<()> {
+    let domain = DslPlanDomain::new(vec![
+        SeriesDomain::new("ID", AtomDomain::<i64>::default()),
+        SeriesDomain::new("value", AtomDomain::<f64>::default()),
+    ])?;
+    for keys in [vec![col("ID"), col("value")], vec![col("value")]] {
+        assert!(
+            truncate_domain(
+                domain.clone(),
+                &Truncation::GroupBy {
+                    keys,
+                    aggs: vec![len()],
+                }
+            )
+            .is_err()
+        );
+    }
+    Ok(())
+}

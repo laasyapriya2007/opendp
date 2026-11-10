@@ -1,12 +1,6 @@
 use std::collections::HashSet;
 
-use crate::{
-    error::Fallible,
-    metrics::Bound,
-    polars::literal_value_of,
-    traits::InfAdd,
-    transformations::make_stable_lazyframe::group_by::{Resize, check_infallible},
-};
+use crate::{error::Fallible, metrics::Bound, polars::literal_value_of, traits::InfAdd};
 use opendp_derive::proven;
 #[cfg(not(patch_polars))]
 use polars_plan::dsl::WindowType;
@@ -254,7 +248,7 @@ fn match_truncation_predicate(predicate: &Expr, identifier: &Expr) -> Fallible<O
             let Some(bound) = num_groups.or(per_group) else {
                 return fallible!(
                     MakeTransformation,
-                    "expected a predicate that limits per_group contributions (via int_range) or num_groups contributions (via rank). Found {:?}",
+                    "expected a predicate that limits per_group contributions (via a full OpenDP random permutation of int_range) or num_groups contributions (via dense rank). Sorted index selection is not supported. Found {:?}",
                     function
                 );
             };
@@ -360,43 +354,19 @@ fn match_num_groups_predicate(
 /// when grouped by the non-identifier columns in `partition_by`.
 #[proven]
 fn match_per_group_predicate(
-    mut enumeration: &Expr,
+    enumeration: &Expr,
     partition_by: &Vec<Expr>,
     identifier: &Expr,
     threshold: u32,
 ) -> Fallible<Option<Bound>> {
-    // reorderings of an enumeration are still enumerations
-    match enumeration {
-        Expr::Function {
-            input, function, ..
-        } => {
-            // FunctionExprs that may reorder data
-            let is_reorder = match function {
-                FunctionExpr::Reverse => true,
-                FunctionExpr::Random { method, .. } => {
-                    // since method is not public, we can't match on the enum directly.
-                    // however, we can convert it to a string and match on that.
-                    let method: &'static str = method.into();
-                    method == "shuffle"
-                }
-                _ => false,
-            };
-
-            if is_reorder {
-                enumeration = input
-                    .get(0)
-                    .ok_or_else(|| err!(MakeTransformation, "expected one input"))?;
-            }
-        }
-        Expr::SortBy { expr, by, .. } => {
-            by.iter()
-                .try_for_each(|key| check_infallible(key, Resize::Ban))?;
-            enumeration = expr.as_ref()
-        }
-        _ => (),
-    };
-
-    if enumeration.ne(&int_range(lit(0), len(), 1, DataType::Int64)) {
+    let range = int_range(lit(0), len(), 1, DataType::Int64);
+    if enumeration == &range {
+        return fallible!(
+            MakeTransformation,
+            "per-group truncation requires a full trusted random permutation; physical first/last are not stable under unordered identifier metrics."
+        );
+    }
+    if !is_full_random_permutation_of(enumeration, &range) {
         return Ok(None);
     }
     // we now know this is a per group predicate,
@@ -420,4 +390,18 @@ fn match_per_group_predicate(
         per_group: Some(threshold),
         num_groups: None,
     }))
+}
+
+/// A full permutation preserves the window length; a finite sample does not.
+fn is_full_random_permutation_of(expr: &Expr, expected: &Expr) -> bool {
+    #[cfg(feature = "ffi")]
+    if let Some(data) = crate::polars::random_permutation::match_random_permutation(expr) {
+        let Expr::Function { input, .. } = expr else {
+            return false;
+        };
+        return data == expected
+            && matches!(input.get(1), Some(Expr::Literal(limit)) if limit.is_scalar() && limit.is_null());
+    }
+    let _ = (expr, expected);
+    false
 }
