@@ -110,6 +110,31 @@ class DPExpr(object):
     def __init__(self, expr):
         self.expr = expr
 
+    def random_permutation(self, k: int | None = None):
+        """Return a uniform random ordered sample of up to ``k`` rows.
+
+        With ``k=None``, all rows are returned in uniformly random order.
+        A Struct input keeps its fields aligned under the same permutation.
+        Uses OpenDP's random source; randomness is generated at execution.
+        Materializes the input and an O(n) index buffer. Shuffle a Struct rather
+        than individual columns when their rows must remain aligned.
+
+        :param k: maximum sample size; None returns a full permutation.
+        """
+        from polars import UInt64, lit
+        from polars.plugins import register_plugin_function  # type: ignore[import-not-found]
+
+        if k is not None and (not isinstance(k, int) or isinstance(k, bool) or k < 0):
+            raise ValueError("k must be a nonnegative integer or None")
+        return register_plugin_function(
+            plugin_path=_get_opendp_polars_lib_path(),
+            function_name="random_permutation_plugin",
+            # Larger limits are equivalent: Polars cannot have 2**64 rows.
+            args=(self.expr, lit(None if k is None else min(k, 2**64 - 1), dtype=UInt64)),
+            is_elementwise=False,
+            changes_length=k is not None,
+        )
+
     def noise(
         self,
         scale: float | None = None,

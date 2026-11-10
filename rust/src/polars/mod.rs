@@ -35,6 +35,9 @@ use serde::{Deserialize, Serialize};
 
 pub mod accuracy;
 
+#[cfg(feature = "ffi")]
+pub(crate) mod random_permutation;
+
 #[cfg(test)]
 mod test;
 
