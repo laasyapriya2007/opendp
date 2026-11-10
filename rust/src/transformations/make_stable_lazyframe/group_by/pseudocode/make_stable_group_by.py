@@ -1,7 +1,7 @@
 # type: ignore
 def make_stable_group_by(
     input_domain: DslPlanDomain, input_metric: FrameDistance[M], plan: DslPlan
-) -> Transformation[DslPlanDomain, DslPlanDomain, FrameDistance[M], FrameDistance[M]]:
+) -> Transformation[DslPlanDomain, DslPlanDomain, FrameDistance[M], FrameDistance[SymmetricDistance]]:
     match plan:
         case DslPlan.GroupBy(input, keys, aggs, apply, maintain_order, options):
             pass
@@ -10,9 +10,6 @@ def make_stable_group_by(
 
     if apply is not None:
         raise "apply is not currently supported"
-
-    if maintain_order:
-        raise "maintain_order is wasted compute because row ordering is protected information"
 
     if options != GroupbyOptions.default():
         raise "options is not currently supported"
@@ -30,6 +27,11 @@ def make_stable_group_by(
 
     for agg in aggs:  # |\label{line:infallible-aggs}|
         check_infallible(agg, Resize.Allow)
+
+    if not M.ORDERED:  # |\label{line:permutation-invariance}|
+        schema = Schema.from_columns(middle_domain.series_domains)
+        for agg in aggs:
+            check_permutation_invariance(agg, schema)
 
     if middle_metric[0].identifier().is_some():  # |\label{line:identifier}|
         raise "identifier is not currently supported"
@@ -80,11 +82,11 @@ def make_stable_group_by(
             keys=keys,
             aggs=aggs,
             apply=None,
-            maintain_order=False,
+            maintain_order=maintain_order,
             options=options,
         ),
         middle_metric,
-        middle_metric,
+        FrameDistance(SymmetricDistance),
         StabilityMap.new_fallible(stability_map),
     )
 

@@ -68,12 +68,16 @@ pub extern "C" fn opendp_transformations__make_stable_lazyframe(
                     lazyframe
                 )
             )
+        // FrameDistance<InsertDeleteDistance> -> FrameDistance<SymmetricDistance>
+        } else if MI == Type::of::<FrameDistance<InsertDeleteDistance>>() && MO == Type::of::<FrameDistance<SymmetricDistance>>() {
+            let input_metric = try_!(input_metric.downcast_ref::<FrameDistance<InsertDeleteDistance>>()).clone();
+            make_stable_lazyframe::<_, FrameDistance<SymmetricDistance>>(input_domain, input_metric, lazyframe).into_any()
         // FrameDistance<SymmetricIdDistance> -> FrameDistance<SymmetricDistance>
         } else if MI == Type::of::<FrameDistance<SymmetricIdDistance>>() && MO == Type::of::<FrameDistance<SymmetricDistance>>() {
             let input_metric = try_!(input_metric.downcast_ref::<FrameDistance<SymmetricIdDistance>>()).clone();
             make_stable_lazyframe::<_, FrameDistance<SymmetricDistance>>(input_domain, input_metric, lazyframe).into_any()
         } else {
-            err!(FFI, "MI ({:?}) must match MO ({:?}), or FrameDistance<SymmetricIdDistance> -> FrameDistance<SymmetricDistance>", MI.descriptor, MO.descriptor).into()
+            err!(FFI, "MI ({:?}) must match MO ({:?}), or FrameDistance<InsertDeleteDistance/SymmetricIdDistance> -> FrameDistance<SymmetricDistance>", MI.descriptor, MO.descriptor).into()
         }
     } else if dispatch!(is_in, [(MI, [SymmetricDistance, SymmetricIdDistance, InsertDeleteDistance])], ()).is_some() {
         // MI -> FrameDistance<MI>
@@ -98,22 +102,35 @@ pub extern "C" fn opendp_transformations__make_stable_lazyframe(
                     lazyframe
                 )
             )
+        // InsertDeleteDistance -> FrameDistance<SymmetricDistance>
+        } else if MI == Type::of::<InsertDeleteDistance>() && MO == Type::of::<FrameDistance<SymmetricDistance>>() {
+            let input_metric = try_!(input_metric.downcast_ref::<InsertDeleteDistance>()).clone();
+            make_stable_lazyframe::<_, FrameDistance<SymmetricDistance>>(input_domain, input_metric, lazyframe).into_any()
         // SymmetricIdDistance -> FrameDistance<SymmetricDistance>
         } else if MI == Type::of::<SymmetricIdDistance>() && MO == Type::of::<FrameDistance<SymmetricDistance>>() {
             let input_metric = try_!(input_metric.downcast_ref::<SymmetricIdDistance>()).clone();
             make_stable_lazyframe::<_, FrameDistance<SymmetricDistance>>(input_domain, input_metric, lazyframe).into_any()
         } else {
-            err!(FFI, "MI ({:?}) must match MO ({:?}), or SymmetricIdDistance -> FrameDistance<SymmetricDistance>", MI.descriptor, MO.descriptor).into()
+            err!(FFI, "MI ({:?}) must match MO ({:?}), or InsertDeleteDistance/SymmetricIdDistance -> FrameDistance<SymmetricDistance>", MI.descriptor, MO.descriptor).into()
         }
+    } else if MI == Type::of::<HammingDistance>() && MO == Type::of::<FrameDistance<SymmetricDistance>>() {
+        let input_metric = try_!(input_metric.downcast_ref::<HammingDistance>()).clone();
+        make_stable_lazyframe::<_, FrameDistance<SymmetricDistance>>(input_domain, input_metric, lazyframe).into_any()
     } else {
         fn monomorphize<MI: BoundedMetric>(
             input_domain: LazyFrameDomain,
             input_metric: &AnyMetric,
             lazyframe: LazyFrame,
+            output_metric: Type,
         ) -> Fallible<AnyTransformation>
         where
             DslPlan: StableDslPlan<MI, FrameDistance<MI::UnboundedMetric>>,
         {
+            // Preserve the historical default, but do not silently ignore an
+            // explicitly requested, unsupported output metric.
+            if output_metric != Type::of::<MI>() && output_metric != Type::of::<FrameDistance<MI::UnboundedMetric>>() {
+                return fallible!(FFI, "Unsupported output metric: {:?}", output_metric.descriptor);
+            }
             let input_metric = input_metric.downcast_ref::<MI>()?.clone();
             make_stable_lazyframe(input_domain, input_metric, lazyframe).into_any()
         }
@@ -123,7 +140,8 @@ pub extern "C" fn opendp_transformations__make_stable_lazyframe(
             (
                 input_domain,
                 input_metric,
-                lazyframe
+                lazyframe,
+                MO
             )
         )
     }.into()

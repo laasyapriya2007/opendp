@@ -185,38 +185,122 @@ impl StableDslPlan<FrameDistance<SymmetricIdDistance>, FrameDistance<SymmetricDi
     }
 }
 
-impl<M: UnboundedMetric> StableDslPlan<FrameDistance<M>, FrameDistance<M>> for DslPlan {
+/// Other plan nodes preserve the input event metric.
+fn make_stable_unbounded_other<M: UnboundedMetric>(
+    plan: DslPlan,
+    input_domain: DslPlanDomain,
+    input_metric: FrameDistance<M>,
+) -> Fallible<Transformation<DslPlanDomain, FrameDistance<M>, DslPlanDomain, FrameDistance<M>>>
+where
+    DslPlan: StableDslPlan<FrameDistance<M>, FrameDistance<M>>,
+{
+    match &plan {
+        DslPlan::IR { dsl, .. } => (**dsl).clone().make_stable(input_domain, input_metric),
+        DslPlan::DataFrameScan { .. } => {
+            source::make_stable_source(input_domain, input_metric, plan)
+        }
+        DslPlan::Filter { .. } => filter::make_stable_filter(input_domain, input_metric, plan),
+        DslPlan::HStack { .. } => h_stack::make_h_stack(input_domain, input_metric, plan),
+        DslPlan::Select { .. } => select::make_select(input_domain, input_metric, plan),
+        dsl => match dsl.describe() {
+            Ok(desc) => fallible!(
+                MakeTransformation,
+                "A step in your query is not recognized at this time: {:?}. {:?}If you would like to see this supported, please file an issue.",
+                desc,
+                get_disabled_features_message()
+            ),
+            Err(e) => fallible!(
+                MakeTransformation,
+                "A step in your query is not recognized at this time, and the step cannot be identified due to the following error: {}. {:?}",
+                e,
+                get_disabled_features_message()
+            ),
+        },
+    }
+}
+
+impl StableDslPlan<FrameDistance<SymmetricDistance>, FrameDistance<SymmetricDistance>> for DslPlan {
     fn make_stable(
         self,
         input_domain: DslPlanDomain,
-        input_metric: FrameDistance<M>,
-    ) -> Fallible<Transformation<DslPlanDomain, FrameDistance<M>, DslPlanDomain, FrameDistance<M>>>
-    {
-        match &self {
-            DslPlan::IR { dsl, .. } => (**dsl).clone().make_stable(input_domain, input_metric),
-            DslPlan::DataFrameScan { .. } => {
-                source::make_stable_source(input_domain, input_metric, self)
+        input_metric: FrameDistance<SymmetricDistance>,
+    ) -> Fallible<
+        Transformation<
+            DslPlanDomain,
+            FrameDistance<SymmetricDistance>,
+            DslPlanDomain,
+            FrameDistance<SymmetricDistance>,
+        >,
+    > {
+        if matches!(self, DslPlan::GroupBy { .. }) {
+            return group_by::make_stable_group_by(input_domain, input_metric, self);
+        }
+        make_stable_unbounded_other(self, input_domain, input_metric)
+    }
+}
+
+macro_rules! impl_unchanged_unbounded {
+    ($metric:ty) => {
+        impl StableDslPlan<FrameDistance<$metric>, FrameDistance<$metric>> for DslPlan {
+            fn make_stable(
+                self, input_domain: DslPlanDomain, input_metric: FrameDistance<$metric>,
+            ) -> Fallible<Transformation<DslPlanDomain, FrameDistance<$metric>, DslPlanDomain, FrameDistance<$metric>>> {
+                if matches!(self, DslPlan::GroupBy { .. }) {
+                    return fallible!(MakeTransformation,
+                        "group-by cannot preserve this input metric; request FrameDistance<SymmetricDistance>.");
+                }
+                make_stable_unbounded_other(self, input_domain, input_metric)
             }
+        }
+    };
+}
+impl_unchanged_unbounded!(crate::metrics::InsertDeleteDistance);
+impl_unchanged_unbounded!(SymmetricIdDistance);
+
+impl
+    StableDslPlan<
+        FrameDistance<crate::metrics::InsertDeleteDistance>,
+        FrameDistance<SymmetricDistance>,
+    > for DslPlan
+{
+    fn make_stable(
+        self,
+        input_domain: DslPlanDomain,
+        input_metric: FrameDistance<crate::metrics::InsertDeleteDistance>,
+    ) -> Fallible<
+        Transformation<
+            DslPlanDomain,
+            FrameDistance<crate::metrics::InsertDeleteDistance>,
+            DslPlanDomain,
+            FrameDistance<SymmetricDistance>,
+        >,
+    > {
+        match self {
             DslPlan::GroupBy { .. } => {
                 group_by::make_stable_group_by(input_domain, input_metric, self)
             }
+            DslPlan::IR { dsl, .. } => (*dsl).clone().make_stable(input_domain, input_metric),
             DslPlan::Filter { .. } => filter::make_stable_filter(input_domain, input_metric, self),
             DslPlan::HStack { .. } => h_stack::make_h_stack(input_domain, input_metric, self),
             DslPlan::Select { .. } => select::make_select(input_domain, input_metric, self),
-            dsl => match dsl.describe() {
-                Ok(describe) => fallible!(
-                    MakeTransformation,
-                    "A step in your query is not recognized at this time: {:?}. {:?}If you would like to see this supported, please file an issue.",
-                    describe,
-                    get_disabled_features_message()
-                ),
-                Err(e) => fallible!(
-                    MakeTransformation,
-                    "A step in your query is not recognized at this time, and the step cannot be identified due to the following error: {}. {:?}",
-                    e,
-                    get_disabled_features_message()
-                ),
-            },
+            DslPlan::DataFrameScan { .. } => {
+                let t_source =
+                    source::make_stable_source(input_domain.clone(), input_metric.clone(), self)?;
+                // Forgetting order cannot increase any row-contribution bound.
+                t_source
+                    >> Transformation::new(
+                        input_domain.clone(),
+                        input_metric,
+                        input_domain,
+                        FrameDistance(SymmetricDistance),
+                        Function::new(Clone::clone),
+                        StabilityMap::new(Clone::clone),
+                    )?
+            }
+            _ => fallible!(
+                MakeTransformation,
+                "Plan is not supported in ordered-to-unordered analysis."
+            ),
         }
     }
 }

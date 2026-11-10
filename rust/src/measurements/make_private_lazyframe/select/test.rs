@@ -66,7 +66,7 @@ fn test_fail_select_invalid_expression() -> Fallible<()> {
 
     let lf = df!("A" => &[1i32, 2, 2])?.lazy();
 
-    let error_variant_res = make_private_select::<_, _>(
+    let error_variant_res = make_private_select::<_, SymmetricDistance, _>(
         lf_domain,
         FrameDistance(SymmetricDistance),
         MaxDivergence,

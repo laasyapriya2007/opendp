@@ -15,6 +15,7 @@ use crate::{
     measures::{Approximate, MaxDivergence, ZeroConcentratedDivergence},
     metrics::{
         ChangeOneDistance, ChangeOneIdDistance, FrameDistance, HammingDistance, L01InfDistance,
+        SymmetricDistance,
     },
     polars::{OnceFrame, get_disabled_features_message},
     transformations::{
@@ -38,6 +39,57 @@ mod postprocess;
 #[cfg(feature = "contrib")]
 mod select;
 
+fn make_private_aggregation_with_metric<MI, ME, MO>(
+    input_domain: DslPlanDomain,
+    input_metric: FrameDistance<MI>,
+    output_measure: MO,
+    plan: DslPlan,
+    global_scale: Option<f64>,
+    threshold: Option<u32>,
+) -> Fallible<Measurement<DslPlanDomain, FrameDistance<MI>, MO, DslPlan>>
+where
+    MI: 'static + UnboundedMetric,
+    ME: UnboundedMetric,
+    MO: 'static + ApproximateMeasure,
+    MO::Distance: Debug,
+    Expr: PrivateExpr<L01InfDistance<ME>, MO>,
+    DslPlan: StableDslPlan<FrameDistance<MI>, FrameDistance<ME>>,
+{
+    #[cfg(feature = "contrib")]
+    if group_by::match_group_by(plan.clone())?.is_some() {
+        return group_by::make_private_group_by::<MI, ME, MO>(
+            input_domain,
+            input_metric,
+            output_measure,
+            plan,
+            global_scale,
+            threshold,
+        );
+    }
+    match plan {
+        #[cfg(feature = "contrib")]
+        plan if matches!(plan, DslPlan::Select { .. }) => {
+            select::make_private_select::<MI, ME, MO>(
+                input_domain,
+                input_metric,
+                output_measure,
+                plan,
+                global_scale,
+            )
+        }
+
+        plan => fallible!(
+            MakeMeasurement,
+            "A step in your query is not recognized at this time: {:?}. {:?}If you would like to see this supported, please file an issue.",
+            plan.describe()?,
+            get_disabled_features_message()
+        ),
+    }
+}
+
+/// Prefer the original event metric, preserving ordered analysis when possible.
+/// A stable group-by may instead yield unordered rows; only retry that conversion
+/// at the private aggregation boundary, not before the stable group-by.
 fn make_private_aggregation<MI, MO>(
     input_domain: DslPlanDomain,
     input_metric: FrameDistance<MI>,
@@ -51,36 +103,33 @@ where
     MI::EventMetric: UnboundedMetric,
     MO: 'static + ApproximateMeasure,
     MO::Distance: Debug,
-    Expr: PrivateExpr<L01InfDistance<MI::EventMetric>, MO>,
-    DslPlan: StableDslPlan<FrameDistance<MI>, FrameDistance<MI::EventMetric>>,
+    Expr: PrivateExpr<L01InfDistance<MI::EventMetric>, MO>
+        + PrivateExpr<L01InfDistance<SymmetricDistance>, MO>,
+    DslPlan: StableDslPlan<FrameDistance<MI>, FrameDistance<MI::EventMetric>>
+        + StableDslPlan<FrameDistance<MI>, FrameDistance<SymmetricDistance>>,
 {
-    #[cfg(feature = "contrib")]
-    if group_by::match_group_by(plan.clone())?.is_some() {
-        return group_by::make_private_group_by::<MI, MO>(
-            input_domain,
-            input_metric,
-            output_measure,
-            plan,
-            global_scale,
-            threshold,
-        );
-    }
-    match plan {
-        #[cfg(feature = "contrib")]
-        plan if matches!(plan, DslPlan::Select { .. }) => select::make_private_select::<MI, MO>(
-            input_domain,
-            input_metric,
-            output_measure,
-            plan,
-            global_scale,
-        ),
-
-        plan => fallible!(
-            MakeMeasurement,
-            "A step in your query is not recognized at this time: {:?}. {:?}If you would like to see this supported, please file an issue.",
-            plan.describe()?,
-            get_disabled_features_message()
-        ),
+    let original = make_private_aggregation_with_metric::<MI, MI::EventMetric, MO>(
+        input_domain.clone(),
+        input_metric.clone(),
+        output_measure.clone(),
+        plan.clone(),
+        global_scale,
+        threshold,
+    );
+    match original {
+        Ok(measurement) => Ok(measurement),
+        Err(original) if MI::ORDERED => {
+            make_private_aggregation_with_metric::<MI, SymmetricDistance, MO>(
+                input_domain,
+                input_metric,
+                output_measure,
+                plan,
+                global_scale,
+                threshold,
+            )
+            .map_err(|_| original)
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -168,7 +217,8 @@ impl<MI> PrivateDslPlan<FrameDistance<MI>, MaxDivergence> for DslPlan
 where
     MI: UnboundedMetric,
     MI::EventMetric: UnboundedMetric,
-    DslPlan: StableDslPlan<FrameDistance<MI>, FrameDistance<MI::EventMetric>>,
+    DslPlan: StableDslPlan<FrameDistance<MI>, FrameDistance<MI::EventMetric>>
+        + StableDslPlan<FrameDistance<MI>, FrameDistance<SymmetricDistance>>,
     (DslPlanDomain, FrameDistance<MI>): MetricSpace,
 {
     fn make_private(
@@ -209,7 +259,8 @@ impl<MI> PrivateDslPlan<FrameDistance<MI>, ZeroConcentratedDivergence> for DslPl
 where
     MI: UnboundedMetric,
     MI::EventMetric: UnboundedMetric,
-    DslPlan: StableDslPlan<FrameDistance<MI>, FrameDistance<MI::EventMetric>>,
+    DslPlan: StableDslPlan<FrameDistance<MI>, FrameDistance<MI::EventMetric>>
+        + StableDslPlan<FrameDistance<MI>, FrameDistance<SymmetricDistance>>,
 {
     fn make_private(
         self,
@@ -253,8 +304,10 @@ where
     MO: 'static + CompositionMeasure,
     Approximate<MO>: 'static + ApproximateMeasure,
     <Approximate<MO> as Measure>::Distance: Debug,
-    Expr: PrivateExpr<L01InfDistance<MI::EventMetric>, Approximate<MO>>,
+    Expr: PrivateExpr<L01InfDistance<MI::EventMetric>, Approximate<MO>>
+        + PrivateExpr<L01InfDistance<SymmetricDistance>, Approximate<MO>>,
     DslPlan: StableDslPlan<FrameDistance<MI>, FrameDistance<MI::EventMetric>>
+        + StableDslPlan<FrameDistance<MI>, FrameDistance<SymmetricDistance>>
         + PrivateDslPlan<FrameDistance<MI::EventMetric>, MO>
         + PrivateDslPlan<FrameDistance<MI>, MO>,
 {

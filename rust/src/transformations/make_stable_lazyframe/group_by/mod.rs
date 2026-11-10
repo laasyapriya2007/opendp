@@ -3,7 +3,11 @@ use std::collections::HashSet;
 use crate::core::{Function, StabilityMap, Transformation};
 use crate::domains::{Context, DslPlanDomain, FrameDomain, SeriesDomain, WildExprDomain};
 use crate::error::*;
-use crate::metrics::{Bound, Bounds, FrameDistance, L0PInfDistance, L01InfDistance};
+use crate::metrics::{
+    Bound, Bounds, FrameDistance, L0PInfDistance, L01InfDistance, SymmetricDistance,
+};
+#[cfg(feature = "ffi")]
+use crate::polars::random_permutation::match_random_permutation;
 use crate::traits::{InfMul, option_min};
 use crate::transformations::StableExpr;
 use crate::transformations::traits::UnboundedMetric;
@@ -11,6 +15,7 @@ use polars::chunked_array::cast::CastOptions;
 use polars::prelude::*;
 #[cfg(not(patch_polars))]
 use polars_plan::dsl::WindowType;
+use polars_plan::plans::{DynLiteralValue, LiteralValue};
 use polars_plan::prelude::GroupbyOptions;
 
 use super::StableDslPlan;
@@ -28,7 +33,17 @@ pub fn make_stable_group_by<M: UnboundedMetric>(
     input_domain: DslPlanDomain,
     input_metric: FrameDistance<M>,
     plan: DslPlan,
-) -> Fallible<Transformation<DslPlanDomain, FrameDistance<M>, DslPlanDomain, FrameDistance<M>>> {
+) -> Fallible<
+    Transformation<
+        DslPlanDomain,
+        FrameDistance<M>,
+        DslPlanDomain,
+        FrameDistance<SymmetricDistance>,
+    >,
+>
+where
+    DslPlan: StableDslPlan<FrameDistance<M>, FrameDistance<M>>,
+{
     #[cfg(patch_polars)]
     let DslPlan::GroupBy {
         input,
@@ -72,13 +87,6 @@ pub fn make_stable_group_by<M: UnboundedMetric>(
         );
     }
 
-    if maintain_order {
-        return fallible!(
-            MakeTransformation,
-            "maintain_order is wasted compute because row ordering is protected information"
-        );
-    }
-
     if options.as_ref() != &GroupbyOptions::default() {
         return fallible!(
             MakeTransformation,
@@ -105,6 +113,10 @@ pub fn make_stable_group_by<M: UnboundedMetric>(
             let t_key: Transformation<_, _, _, L01InfDistance<M>> = key
                 .clone()
                 .make_stable(expr_domain.clone(), L0PInfDistance(middle_metric.0.clone()))?;
+            if !M::ORDERED && !canonical_sort_dtype(&t_key.output_domain.column.dtype()) {
+                return fallible!(MakeTransformation,
+                    "Floating-point grouping keys may emit permutation-dependent representatives (signed zeros or NaN payloads).");
+            }
             Ok(t_key.invoke(&input)?.expr)
         })
         .collect::<Fallible<Vec<_>>>()?;
@@ -112,6 +124,19 @@ pub fn make_stable_group_by<M: UnboundedMetric>(
     // check that aggregations are infallible. Aggregations are allowed to resize data
     aggs.iter()
         .try_for_each(|e| check_infallible(e, Resize::Allow))?;
+    // Under unordered adjacency, even zero-distance row permutations must not
+    // alter the aggregate distribution. A trusted uniform random permutation
+    // establishes this invariance for order-sensitive aggregations.
+    if !M::ORDERED {
+        let schema = Schema::from_iter(
+            middle_domain
+                .series_domains
+                .iter()
+                .map(|column| Field::new(column.name.clone(), column.dtype())),
+        );
+        aggs.iter()
+            .try_for_each(|e| check_permutation_invariance(e, &schema))?;
+    }
 
     if middle_metric.0.identifier().is_some() {
         return fallible!(
@@ -144,7 +169,7 @@ pub fn make_stable_group_by<M: UnboundedMetric>(
         middle_domain,
         middle_metric.clone(),
         output_domain,
-        middle_metric.clone(),
+        FrameDistance(SymmetricDistance),
         Function::new(move |plan: &DslPlan| {
             #[cfg(patch_polars)]
             let output = DslPlan::GroupBy {
@@ -153,7 +178,7 @@ pub fn make_stable_group_by<M: UnboundedMetric>(
                 predicates: vec![],
                 aggs: aggs.clone(),
                 apply: None,
-                maintain_order: false,
+                maintain_order,
                 options: options.clone(),
             };
             #[cfg(not(patch_polars))]
@@ -162,7 +187,7 @@ pub fn make_stable_group_by<M: UnboundedMetric>(
                 keys: stable_keys.clone(),
                 aggs: aggs.clone(),
                 apply: None,
-                maintain_order: false,
+                maintain_order,
                 options: options.clone(),
             };
             output
@@ -205,14 +230,175 @@ pub(crate) enum Resize {
 
 const INVITE: &'static str = "Please open an issue if this would be useful to you.";
 
-/// # Proof Definition
-/// Returns an error if the expression may raise data-dependent errors,
-/// or if `resize` is Ban and the expression resizes the data.
+/// Check that an aggregate's distribution is invariant under input-row permutations.
 ///
-/// A resize is an expression that changes the number of rows in the data.
-/// Scalar-valued expressions are not considered a resize,
-/// because they can be broadcasted.
+/// This deliberately starts with a narrow allowlist: unsupported expressions
+/// are rejected until their permutation behavior has been proved.
+pub(crate) fn check_permutation_invariance(expr: &Expr, schema: &Schema) -> Fallible<()> {
+    match expr {
+        Expr::Alias(inner, _) | Expr::KeepName(inner) => {
+            check_permutation_invariance(inner, schema)
+        }
+        Expr::RenameAlias { expr, .. } => check_permutation_invariance(expr, schema),
+        Expr::Cast { expr, .. } => check_permutation_invariance(expr, schema),
+        Expr::BinaryExpr { left, right, .. } => {
+            check_permutation_invariance(left, schema)?;
+            check_permutation_invariance(right, schema)
+        }
+        Expr::Len => Ok(()),
+        Expr::Literal(value) if value.is_scalar() => Ok(()),
+        Expr::Agg(agg) => {
+            // Integer addition is permutation-invariant. Floating-point
+            // addition is not, and requires an established ordering.
+            if let AggExpr::Sum(input) = agg {
+                if is_rowwise(input) {
+                    use DataType::*;
+                    let dtype = input.clone().to_field(schema)?.dtype;
+                    if matches!(
+                        dtype,
+                        UInt8 | UInt16 | UInt32 | UInt64 | Int8 | Int16 | Int32 | Int64
+                    ) {
+                        return Ok(());
+                    }
+                }
+            }
+            let (input, ordered) = match agg {
+                AggExpr::Count { input, .. } | AggExpr::NUnique(input) => (input.as_ref(), false),
+                // Sorted-column fast paths can select a bit-distinct signed-zero
+                // representative. Float min/max therefore also need randomization.
+                AggExpr::Max { input, .. } | AggExpr::Min { input, .. } => (
+                    input.as_ref(),
+                    !canonical_sort_dtype(&input.clone().to_field(schema)?.dtype),
+                ),
+                AggExpr::Sum(input)
+                | AggExpr::Mean(input)
+                | AggExpr::Median(input)
+                | AggExpr::First(input)
+                | AggExpr::Last(input)
+                | AggExpr::Implode(input)
+                | AggExpr::Std(input, _)
+                | AggExpr::Var(input, _) => (input.as_ref(), true),
+                AggExpr::Quantile { expr, quantile, .. } => {
+                    check_quantile(quantile)?;
+                    (expr.as_ref(), true)
+                }
+                #[cfg(patch_polars)]
+                AggExpr::FirstNonNull(input) | AggExpr::LastNonNull(input) => {
+                    (input.as_ref(), true)
+                }
+                _ => {
+                    return fallible!(
+                        MakeTransformation,
+                        "Aggregation has no established permutation-invariance proof."
+                    );
+                }
+            };
+            if ordered {
+                if establishes_order(input) {
+                    Ok(())
+                } else {
+                    fallible!(
+                        MakeTransformation,
+                        "Order-sensitive aggregation requires a trusted random permutation of its input. Ordinary sorting is not trusted because Polars may skip it based on sorted-state metadata."
+                    )
+                }
+            } else if is_rowwise(input) {
+                Ok(())
+            } else {
+                fallible!(
+                    MakeTransformation,
+                    "The input to this aggregation is not proven permutation-equivariant."
+                )
+            }
+        }
+        _ => fallible!(
+            MakeTransformation,
+            "Aggregation expression has no established permutation-invariance proof."
+        ),
+    }
+}
+
+fn is_rowwise(expr: &Expr) -> bool {
+    match expr {
+        Expr::Column(_) | Expr::Element => true,
+        // Positional Series/range literals do not follow rows when permuted.
+        Expr::Literal(value) => value.is_scalar(),
+        Expr::Alias(inner, _) | Expr::KeepName(inner) => is_rowwise(inner),
+        Expr::RenameAlias { expr, .. } | Expr::Cast { expr, .. } => is_rowwise(expr),
+        Expr::BinaryExpr { left, right, .. } => is_rowwise(left) && is_rowwise(right),
+        // Only struct construction is established to be row-by-row here.
+        // Other functions may be cumulative, aggregate, or order-sensitive.
+        Expr::Function {
+            input,
+            function: FunctionExpr::AsStruct,
+        } => input.iter().all(is_rowwise),
+        _ => false,
+    }
+}
+
+fn establishes_order(expr: &Expr) -> bool {
+    #[cfg(feature = "ffi")]
+    if let Some(data) = match_random_permutation(expr) {
+        return is_rowwise(data);
+    }
+    match expr {
+        Expr::Alias(inner, _) | Expr::KeepName(inner) => establishes_order(inner),
+        Expr::RenameAlias { expr, .. } | Expr::Cast { expr, .. } => establishes_order(expr),
+        // Deterministic unary postprocessing preserves distributional
+        // invariance, not necessarily order. Infallibility is checked separately.
+        Expr::Function { input, .. } if input.len() == 1 => establishes_order(&input[0]),
+        _ => false,
+    }
+}
+
+pub(super) fn canonical_sort_dtype(dtype: &DataType) -> bool {
+    match dtype {
+        DataType::Float32 | DataType::Float64 => false,
+        DataType::List(inner) | DataType::Array(inner, _) => canonical_sort_dtype(inner),
+        DataType::Struct(fields) => fields
+            .iter()
+            .all(|field| canonical_sort_dtype(field.dtype())),
+        _ => true,
+    }
+}
+
+/// Quantile parameters are evaluated against the entire frame by Polars,
+/// rather than just the group. Require a public scalar to preserve group locality.
+fn check_quantile(expr: &Expr) -> Fallible<()> {
+    let value = match expr {
+        Expr::Literal(LiteralValue::Scalar(value)) if value.dtype().is_numeric() => {
+            value.value().try_extract::<f64>().ok()
+        }
+        Expr::Literal(LiteralValue::Dyn(DynLiteralValue::Int(value))) => Some(*value as f64),
+        Expr::Literal(LiteralValue::Dyn(DynLiteralValue::Float(value))) => Some(*value),
+        _ => None,
+    };
+    if value.is_some_and(|value| value.is_finite() && (0.0..=1.0).contains(&value)) {
+        Ok(())
+    } else {
+        fallible!(
+            MakeTransformation,
+            "quantile requires a public numeric scalar literal in [0, 1]."
+        )
+    }
+}
+
+/// # Proof Definition
+/// Reject expressions that may raise data-dependent errors, access physical
+/// row indices, or use data-dependent cross-group quantile parameters.
+/// Also reject resizing when `resize` is Ban. Scalar-valued expressions can
+/// broadcast, so they are not considered a resize.
 pub(crate) fn check_infallible(expr: &Expr, resize: Resize) -> Fallible<()> {
+    #[cfg(feature = "ffi")]
+    if let Some(data) = match_random_permutation(expr) {
+        if matches!(resize, Resize::Ban) {
+            return fallible!(
+                MakeTransformation,
+                "random_permutation may change expression length."
+            );
+        }
+        return check_infallible(data, Resize::Allow);
+    }
     Ok(match expr {
         #[cfg(patch_polars)]
         Expr::Rolling {
@@ -269,7 +455,14 @@ pub(crate) fn check_infallible(expr: &Expr, resize: Resize) -> Fallible<()> {
         Expr::Alias(e, _) => check_infallible(e.as_ref(), resize)?,
         Expr::Column(_) => (),
         Expr::Selector(_) => (),
-        Expr::Literal(_) => (),
+        Expr::Literal(value) => {
+            if !value.is_scalar() {
+                return fallible!(
+                    MakeTransformation,
+                    "Only scalar literals are supported; positional Series/range literals may change unrelated groups or cause length errors."
+                );
+            }
+        }
         Expr::BinaryExpr { left, right, .. } => {
             check_infallible(&left, Resize::Ban)?;
             check_infallible(&right, Resize::Ban)?;
@@ -302,12 +495,22 @@ pub(crate) fn check_infallible(expr: &Expr, resize: Resize) -> Fallible<()> {
             AggExpr::Last(e) => check_infallible(e, Resize::Allow)?,
             AggExpr::Implode(e) => check_infallible(e, Resize::Allow)?,
             AggExpr::Count { input: e, .. } => check_infallible(e, Resize::Allow)?,
-            AggExpr::Quantile { expr: e, .. } => check_infallible(e, Resize::Allow)?,
+            AggExpr::Quantile {
+                expr: e, quantile, ..
+            } => {
+                check_quantile(quantile)?;
+                check_infallible(e, Resize::Allow)?;
+            }
             AggExpr::Max { input: e, .. } => check_infallible(e, Resize::Allow)?,
             AggExpr::Min { input: e, .. } => check_infallible(e, Resize::Allow)?,
             AggExpr::Std(e, _) => check_infallible(e, Resize::Allow)?,
             AggExpr::Var(e, _) => check_infallible(e, Resize::Allow)?,
-            AggExpr::AggGroups(e) => check_infallible(e, Resize::Allow)?,
+            AggExpr::AggGroups(_) => {
+                return fallible!(
+                    MakeTransformation,
+                    "agg_groups exposes physical row indices, which can change in unrelated groups."
+                );
+            }
             #[cfg(patch_polars)]
             AggExpr::FirstNonNull(e) | AggExpr::LastNonNull(e) => {
                 check_infallible(e, Resize::Allow)?

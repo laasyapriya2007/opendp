@@ -33,6 +33,9 @@ use polars_plan::prelude::{DistinctOptionsDSL, ProjectionOptions};
 #[proven]
 /// Create a private version of an aggregate operation on a LazyFrame.
 ///
+/// `ME` is the event metric after the stable input plan, which may forget order.
+/// It is not necessarily the event metric associated with the original `MI`.
+///
 /// # Arguments
 /// * `input_domain` - The domain of the input LazyFrame.
 /// * `input_metric` - The metric of the input LazyFrame.
@@ -40,7 +43,7 @@ use polars_plan::prelude::{DistinctOptionsDSL, ProjectionOptions};
 /// * `plan` - The LazyFrame to transform.
 /// * `global_scale` - The parameter for the measurement.
 /// * `threshold` - Only keep groups with length greater than threshold
-pub(crate) fn make_private_group_by<MI, MO>(
+pub(crate) fn make_private_group_by<MI, ME, MO>(
     input_domain: DslPlanDomain,
     input_metric: FrameDistance<MI>,
     output_measure: MO,
@@ -50,11 +53,10 @@ pub(crate) fn make_private_group_by<MI, MO>(
 ) -> Fallible<Measurement<DslPlanDomain, FrameDistance<MI>, MO, DslPlan>>
 where
     MI: 'static + UnboundedMetric,
-    MI::EventMetric: UnboundedMetric,
+    ME: UnboundedMetric,
     MO: 'static + ApproximateMeasure,
-    Expr: PrivateExpr<L01InfDistance<MI::EventMetric>, MO>
-        + StableExpr<L01InfDistance<MI::EventMetric>, L01InfDistance<MI::EventMetric>>,
-    DslPlan: StableDslPlan<FrameDistance<MI>, FrameDistance<MI::EventMetric>>,
+    Expr: PrivateExpr<L01InfDistance<ME>, MO> + StableExpr<L01InfDistance<ME>, L01InfDistance<ME>>,
+    DslPlan: StableDslPlan<FrameDistance<MI>, FrameDistance<ME>>,
 {
     let is_truncated = input_metric.0.identifier().is_some();
 

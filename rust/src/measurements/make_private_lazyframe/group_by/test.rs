@@ -113,7 +113,7 @@ fn test_aggregate() -> Fallible<()> {
         "C" => &[8i32, 9, 10],)?
     .lazy();
 
-    let error_variant_res = make_private_group_by::<_, _>(
+    let error_variant_res = make_private_group_by::<_, SymmetricDistance, _>(
         lf_domain,
         FrameDistance(SymmetricDistance),
         MaxDivergence,

@@ -34,7 +34,12 @@ None
 \begin{proof}[Appropriate Output Domain]
     By line \ref{line:stable-keys} the grouping keys are stable row-by-row transformations of the data.
     By line \ref{line:infallible-aggs} the aggregates are infallible.
-    Therefore the function does not raise data-dependent errors.
+    This validation also rejects physical row indices and positional Series/range
+    literals, and requires a public, finite scalar quantile parameter in $[0,1]$:
+    Polars evaluates that parameter
+    against the whole frame, so data-dependent quantiles would not be group-local.
+    Therefore the accepted aggregates do not raise data-dependent errors or
+    access those non-local inputs.
 
     By the postcondition of \texttt{DslPlan.simulate\_schema},
     \texttt{series\_domains} follows the expected schema of members in the output domain.
@@ -61,13 +66,38 @@ This can be extended in the future, but is sufficient for select queries.
 \begin{proof}[Stability guarantee]
     We first simplify the problem on line \ref{line:identifier} by only considering datasets that differ by rows, not by identifiers.
 
+    The output metric is always \texttt{FrameDistance<SymmetricDistance>},
+    regardless of the input metric or \texttt{maintain\_order} option.
+    Thus arbitrary output-group reorderings do not contribute distance.
     The only output distance bound derived is for the empty grouping set, namely the entire output table.
+
+    For unordered inputs, zero-distance permutations must preserve the joint
+    distribution of the aggregates. Line \ref{line:permutation-invariance}
+    enforces a conservative expression allowlist for this purpose.
+    Scalar literals broadcast without depending on row positions; positional
+    Series and range literals do not satisfy that property.
+    Accepted rowwise expressions commute with row permutations.
+    Grouping keys must also have canonical equality representatives; unordered
+    grouping on float-containing keys is rejected because Polars may emit either
+    signed-zero representation. Invariant reducers, such as integer sums, therefore
+    produce the same values. Floating-point min/max are not treated as invariant:
+    Polars' sorted-column fast paths may select bit-distinct tied values.
+    Sensitive reducers, including floating-point sums and means, instead require
+    a trusted uniform random permutation of their input. A generic Polars sort
+    is not treated as canonical: the engine may skip sorting based on existing
+    sorted-state metadata that this analysis does not certify.
+    For uniform permutations, couple corresponding records in the two inputs;
+    the resulting ordered samples agree in distribution, including when only a
+    prefix is retained. Deterministic postprocessing preserves this distributional
+    equality. Independently randomized expressions can be coupled independently.
+    For ordered inputs, unchanged groups already have the same relative input order.
+    In either case, unchanged groups can be coupled to have identical aggregates.
 
     We first retrieve optional upper bounds on the number of rows and groups an individual may contribute on lines \ref{line:total-contributions} and \ref{line:total-groups}.
     Both of these bounds directly correspond to the number of rows an individual may influence in the resulting dataset.
 
     \begin{align}
-        &\max_{x \sim x'} d_{\mathrm{FrameDistance<M>}}(\texttt{function}(x), \texttt{function}(x')) \\
+        &\max_{x \sim x'} d_{\mathrm{FrameDistance<SymmetricDistance>}}(\texttt{function}(x), \texttt{function}(x')) \\
         &\le \mathrm{option\_min}(\texttt{contributed\_rows}, \texttt{contributed\_groups}) \cdot 2
     \end{align}
 

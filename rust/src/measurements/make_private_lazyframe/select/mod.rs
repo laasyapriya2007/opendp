@@ -16,13 +16,16 @@ mod test;
 
 /// Create a private version of an aggregate operation on a LazyFrame.
 ///
+/// `ME` is the event metric after the stable input plan, which may forget order.
+/// It is not necessarily the event metric associated with the original `MI`.
+///
 /// # Arguments
 /// * `input_domain` - The domain of the input LazyFrame.
 /// * `input_metric` - The metric of the input LazyFrame.
 /// * `output_measure` - The measure of the output LazyFrame.
 /// * `plan` - The LazyFrame to transform.
 /// * `global_scale` - The parameter for the measurement.
-pub(crate) fn make_private_select<MI, MO>(
+pub(crate) fn make_private_select<MI, ME, MO>(
     input_domain: DslPlanDomain,
     input_metric: FrameDistance<MI>,
     output_measure: MO,
@@ -31,12 +34,12 @@ pub(crate) fn make_private_select<MI, MO>(
 ) -> Fallible<Measurement<DslPlanDomain, FrameDistance<MI>, MO, DslPlan>>
 where
     MI: 'static + UnboundedMetric,
-    MI::EventMetric: UnboundedMetric,
+    ME: UnboundedMetric,
     MO: 'static + CompositionMeasure,
-    Expr: PrivateExpr<L01InfDistance<MI::EventMetric>, MO>,
-    DslPlan: StableDslPlan<FrameDistance<MI>, FrameDistance<MI::EventMetric>>,
+    Expr: PrivateExpr<L01InfDistance<ME>, MO>,
+    DslPlan: StableDslPlan<FrameDistance<MI>, FrameDistance<ME>>,
     (DslPlanDomain, FrameDistance<MI>): MetricSpace,
-    (DslPlanDomain, FrameDistance<MI::EventMetric>): MetricSpace,
+    (DslPlanDomain, FrameDistance<ME>): MetricSpace,
 {
     let is_truncated = input_metric.0.identifier().is_some();
 
